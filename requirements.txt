@@ -1,0 +1,12 @@
+# 基础依赖
+requests
+python-dotenv
+langchain
+langchain-core
+langchain-openai
+streamlit
+asyncio
+pydantic
+beautifulsoup4
+lxml
+httpx
