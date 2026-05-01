@@ -75,29 +75,37 @@ class AsyncRateLimiter:
 from agent_system.tools.arxiv_tool import search_arxiv
 from agent_system.tools.web_scraper import scrape_webpage
 from agent_system.tools.report_generator import generate_markdown_report
+from agent_system.tools.image_generation import generate_image, edit_image
 
 # ==================== Agent工作流类 ====================
 class AgentWorkflow:
     """Agent工作流管理器"""
-    
-    def __init__(self):
-        self.tools = [search_arxiv, scrape_webpage, generate_markdown_report]
-        self.system_prompt = self._build_system_prompt()
+
+    def __init__(
+        self,
+        temperature: float = 0.7,
+        max_results: int = 5,
+        system_prompt: Optional[str] = None
+    ):
+        self.temperature = temperature
+        self.max_results = max_results
+        self.tools = [search_arxiv, scrape_webpage, generate_markdown_report, generate_image, edit_image]
+        self.system_prompt = system_prompt or self._build_system_prompt()
         self.http_client = httpx.Client(transport=httpx.HTTPTransport(retries=0))
-        
+
         # 使用MiniMax API
         self.llm = ChatOpenAI(
             api_key=os.getenv("MINIMAX_API_KEY"),
             base_url="https://api.minimax.chat/v1",
             model="MiniMax-M2.7",
-            temperature=0.7,
+            temperature=self.temperature,
             http_client=self.http_client
         )
-        
-        # 创建Agent
-        self.agent = create_agent(
-            self.llm, 
-            self.tools, 
+
+        # 创建Agent (使用新API)
+        self.agent_graph = create_agent(
+            model=self.llm,
+            tools=self.tools,
             system_prompt=self.system_prompt
         )
         self.execution_log = None
@@ -113,12 +121,18 @@ class AgentWorkflow:
 ## 可用的工具
 1. **search_arxiv**: 搜索Arxiv上的学术论文
    - 输入参数: query(搜索关键词), max_results(返回数量，默认5)
-   
+
 2. **scrape_webpage**: 抓取网页正文内容
    - 输入参数: url(网页URL)
-   
+
 3. **generate_markdown_report**: 生成Markdown格式的研究报告
    - 输入参数: title(报告标题), content(报告内容), filename(文件名)
+
+4. **generate_image**: 使用MiniMax图像生成模型生成图片
+   - 输入参数: prompt(图片描述), size(尺寸如"1024x1024"), style("natural"或"vivid")
+
+5. **edit_image**: 编辑现有图片（局部重绘）
+   - 输入参数: image_path(原图路径), prompt(编辑提示), mask(蒙版路径可选)
 
 ## 工作流程
 1. 仔细分析用户的研究需求，确定搜索关键词
@@ -129,7 +143,7 @@ class AgentWorkflow:
 6. 使用generate_markdown_report将报告保存为本地文件
 
 ## 输出要求
-- 报告格式：Markdown
+- 报告格式：Markdown，可包含图片
 - 内容要求：
   * 清晰的研究主题和目标
   * 相关论文的详细信息（标题、作者、机构、发表时间）
@@ -137,8 +151,14 @@ class AgentWorkflow:
   * 研究方法和实验结果分析
   * 研究趋势和未来方向
   * 完整的引用和链接
+- 可以使用generate_image工具生成相关图表或插图来增强报告的可读性
 - 语言：使用中文撰写，保持专业、准确、简洁
 - 报告内容不要过长，控制在20000字以内
+
+## 图片生成指南
+- 当需要展示算法流程图、架构图或概念图时使用generate_image
+- 生成的图片会自动保存到images目录
+- 在报告中用 ![描述](图片路径) 引用生成的图片
 
 ## 注意事项
 - 确保报告内容的准确性和完整性
@@ -168,12 +188,21 @@ class AgentWorkflow:
                 "timestamp": datetime.now().strftime("%H:%M:%S")
             })
             
-            # 直接调用LLM生成响应
-            from langchain_core.messages import HumanMessage
-            messages = [HumanMessage(content=query)]
-            response = self.llm.invoke(messages)
-            
-            self.execution_log.final_result = str(response.content)
+            # 直接调用Agent处理请求
+            response = self.agent_graph.invoke({"messages": [{"role": "user", "content": query}]})
+
+            # 解析响应 - 新API返回字典格式
+            if isinstance(response, dict) and "messages" in response:
+                messages = response["messages"]
+                # 获取最后一条assistant消息
+                for msg in reversed(messages):
+                    if hasattr(msg, 'content') and msg.content:
+                        self.execution_log.final_result = str(msg.content)
+                        break
+                else:
+                    self.execution_log.final_result = str(messages[-1]) if messages else "无结果"
+            else:
+                self.execution_log.final_result = str(response)
             
             self.execution_log.steps.append({
                 "step": 3,
@@ -234,7 +263,7 @@ class AgentWorkflow:
                 "timestamp": datetime.now().strftime("%H:%M:%S")
             })
             
-            async for chunk in self.agent.astream({"input": query}):
+            async for chunk in self.agent_graph.astream({"messages": [{"role": "user", "content": query}]}):
                 yield chunk
         
         except Exception as e:
@@ -289,22 +318,45 @@ async def search_multiple_topics(topics: List[str], max_results: int = 3) -> Lis
 
 # ==================== 全局实例 ====================
 _workflow_instance = None
+_workflow_config = {}
 
-def get_workflow() -> AgentWorkflow:
-    """获取全局工作流实例"""
-    global _workflow_instance
-    if _workflow_instance is None:
-        _workflow_instance = AgentWorkflow()
+def get_workflow(
+    temperature: float = 0.7,
+    max_results: int = 5,
+    system_prompt: Optional[str] = None
+) -> AgentWorkflow:
+    """获取全局工作流实例（带配置参数）"""
+    global _workflow_instance, _workflow_config
+
+    # 检查配置是否变化，变化则重新创建实例
+    new_config = {"temperature": temperature, "max_results": max_results, "system_prompt": system_prompt}
+    if _workflow_instance is None or _workflow_config != new_config:
+        _workflow_config = new_config
+        _workflow_instance = AgentWorkflow(
+            temperature=temperature,
+            max_results=max_results,
+            system_prompt=system_prompt
+        )
     return _workflow_instance
 
-def run_agent(query: str) -> Dict[str, Any]:
+def run_agent(
+    query: str,
+    temperature: float = 0.7,
+    max_results: int = 5,
+    system_prompt: Optional[str] = None
+) -> Dict[str, Any]:
     """运行Agent的便捷函数"""
-    workflow = get_workflow()
+    workflow = get_workflow(temperature=temperature, max_results=max_results, system_prompt=system_prompt)
     return workflow.run(query)
 
-async def run_agent_streaming(query: str):
+async def run_agent_streaming(
+    query: str,
+    temperature: float = 0.7,
+    max_results: int = 5,
+    system_prompt: Optional[str] = None
+):
     """流式运行Agent的便捷函数"""
-    workflow = get_workflow()
+    workflow = get_workflow(temperature=temperature, max_results=max_results, system_prompt=system_prompt)
     async for chunk in workflow.run_streaming(query):
         yield chunk
 
@@ -314,8 +366,8 @@ if __name__ == "__main__":
     print(json.dumps({
         "result": result["result"],
         "log": {
-            "query": result["log"].query,
-            "steps": result["log"].steps,
-            "total_duration": result["log"].total_duration
+            "query": result["log"]["query"],
+            "steps": result["log"]["steps"],
+            "total_duration": result["log"]["total_duration"]
         }
     }, ensure_ascii=False, indent=2))
