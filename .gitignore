@@ -1,0 +1,21 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.idea/
+*.iml
+
+# Reports (optional, uncomment if needed)
+# agent_system/reports/*.md
